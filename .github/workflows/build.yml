@@ -1,123 +1,88 @@
-name: Build and Release luci-app-usbmodem
+name: Build luci-app-usbmodem
 
 on:
-  push:
-    branches: [ main, master ]
-    paths:
-      - 'luci-app-usbmodem/**'
   workflow_dispatch:
+  push:
+    tags:
+      - v*
 
 jobs:
-  # 1. 读取版本号并判断是否需要发布
-  check-version:
-    runs-on: ubuntu-22.04
-    outputs:
-      version: ${{ steps.get_version.outputs.version }}
-      should_release: ${{ steps.check_release.outputs.should_release }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Extract version from Makefile
-        id: get_version
-        run: |
-          VERSION=$(grep -E '^PKG_VERSION:=' luci-app-usbmodem/Makefile | cut -d'=' -f2 | tr -d ' ')
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
-          echo "Extracted version: ${VERSION}"
-
-      - name: Check if release already exists
-        id: check_release
-        run: |
-          VERSION="${{ steps.get_version.outputs.version }}"
-          TAG="v${VERSION}"
-          # 使用 GitHub API 检查 tag 是否存在
-          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            "https://api.github.com/repos/${{ github.repository }}/git/ref/tags/${TAG}")
-          if [ "$HTTP_CODE" = "200" ]; then
-            echo "should_release=false" >> $GITHUB_OUTPUT
-            echo "Release with tag ${TAG} already exists, will not create new release."
-          else
-            echo "should_release=true" >> $GITHUB_OUTPUT
-            echo "New version ${VERSION}, will create release."
-          fi
-
-  # 2. 编译多个架构（依赖版本检查完成）
   build:
-    needs: check-version
-    runs-on: ubuntu-22.04
+    name: Build ${{ matrix.arch }}-${{ matrix.sdk }}
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - { arch: "ramips_mt7621", sdk_slug: "ramips_mt7621_gcc-8.4.0_musl", name: "mt7621" }
-          - { arch: "x86_64", sdk_slug: "x86_64_gcc-8.4.0_musl", name: "x86_64" }
-          - { arch: "aarch64_generic", sdk_slug: "aarch64_generic_gcc-8.4.0_musl", name: "aarch64" }
+        arch:
+          - aarch64_cortex-a53
+          - aarch64_cortex-a72
+          - aarch64_cortex-a76
+          - aarch64_generic
+          - arm_cortex-a7
+          - arm_cortex-a9
+          - mips_24kc
+          - mipsel_24kc
+          - riscv64_riscv64
+          - x86_64
+        sdk:
+          - openwrt-24.10
+          - SNAPSHOT
+
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
-          path: package/luci-app-usbmodem
+          fetch-depth: 0
 
-      - name: Download OpenWrt SDK for ${{ matrix.target.arch }}
+      - name: Prepare package feed
         run: |
-          SDK_URL="https://downloads.openwrt.org/releases/23.05.3/targets/${{ matrix.target.arch }}/openwrt-sdk-23.05.3-${{ matrix.target.sdk_slug }}-linux.tar.xz"
-          wget -q -O sdk.tar.xz "$SDK_URL"
-          tar -xf sdk.tar.xz
-          mv openwrt-sdk-* openwrt-sdk
+          mkdir -p feed/luci-app-usbmodem
+          if [ -f "Makefile" ]; then
+            echo "Makefile found in root, copying all files"
+            cp -r * feed/luci-app-usbmodem/ 2>/dev/null || true
+          elif [ -f "luci-app-usbmodem/Makefile" ]; then
+            echo "Makefile found in luci-app-usbmodem subdirectory"
+            cp -r luci-app-usbmodem/* feed/luci-app-usbmodem/
+          else
+            echo "ERROR: Cannot find Makefile"
+            find . -name "Makefile"
+            exit 1
+          fi
+          echo "Final feed structure:"
+          ls -la feed/luci-app-usbmodem/
 
-      - name: Prepare SDK
-        run: |
-          cd openwrt-sdk
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a
-          cp -r ../package/luci-app-usbmodem ./package/
-          echo "CONFIG_PACKAGE_luci-app-usbmodem=y" >> .config
-          make defconfig
+      - name: Build packages
+        uses: sirpdboy/gh-action-sdk@go1.26
+        env:
+          ARCH: ${{ matrix.arch }}-${{ matrix.sdk }}
+          FEEDNAME: packages_ci
+          PACKAGES: luci-app-usbmodem
+          FEED_DIR: ${{ github.workspace }}/feed
+          NO_REFRESH_CHECK: true
 
-      - name: Build IPK
-        run: |
-          cd openwrt-sdk
-          make package/luci-app-usbmodem/compile V=s
-
-      - name: Upload artifact (ipk)
+      - name: Upload artifacts (for manual download)
         uses: actions/upload-artifact@v4
         with:
-          name: ipk-${{ matrix.target.name }}
-          path: openwrt-sdk/bin/packages/*/*/*.ipk
-          retention-days: 7
+          name: ${{ matrix.arch }}-${{ matrix.sdk }}
+          path: |
+            bin/packages/${{ matrix.arch }}/packages_ci/*.ipk
+            bin/packages/riscv64_generic/packages_ci/*.ipk
 
-  # 3. 如果版本变化，创建 Release 并上传所有 ipk
-  release:
-    needs: [check-version, build]
-    runs-on: ubuntu-22.04
-    if: needs.check-version.outputs.should_release == 'true'
-    steps:
-      - name: Download all ipk artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: Collect ipk files
+      - name: Create release archive
+        if: startsWith(github.ref, 'refs/tags/v')
         run: |
-          mkdir release_pkgs
-          find artifacts -name "*.ipk" -exec cp {} release_pkgs/ \;
-          ls -la release_pkgs/
+          if [ "${{ matrix.arch }}" = "riscv64_riscv64" ] && [ "${{ matrix.sdk }}" = "SNAPSHOT" ]; then
+            tar -zcvf ${{ matrix.sdk }}-${{ matrix.arch }}.tar.gz -C bin/packages/riscv64_generic/ packages_ci
+          else
+            tar -zcvf ${{ matrix.sdk }}-${{ matrix.arch }}.tar.gz -C bin/packages/${{ matrix.arch }}/ packages_ci
+          fi
 
-      - name: Create Release
-        uses: softprops/action-gh-release@v1
+      - name: Upload to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: ncipollo/release-action@v1
         with:
-          tag_name: "v${{ needs.check-version.outputs.version }}"
-          name: "v${{ needs.check-version.outputs.version }}"
-          body: |
-            Auto-built luci-app-usbmodem v${{ needs.check-version.outputs.version }}
-            - MT7621 (ramips_mt7621)
-            - x86_64
-            - aarch64_generic
-          draft: false
+          name: ${{ github.ref_name }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          allowUpdates: true
+          replacesArtifacts: true
           prerelease: false
-          files: release_pkgs/*.ipk
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          artifacts: "${{ matrix.sdk }}-${{ matrix.arch }}.tar.gz"
