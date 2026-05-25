@@ -8,18 +8,15 @@ on:
 
 jobs:
   build:
-    name: Build for ${{ matrix.target }}
+    name: Build for ${{ matrix.name }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - ramips/mt7621      # WG3526 及 MT7621 设备
-          - x86/64
-          - aarch64_generic
-          # 可根据需要添加更多，例如：
-          # - mvebu/cortexa9
-          # - ipq40xx/generic
+        include:
+          - { arch: "ramips_mt7621", name: "ramips-mt7621" }
+          - { arch: "x86_64", name: "x86-64" }
+          - { arch: "aarch64_generic", name: "aarch64-generic" }
 
     steps:
       - name: Checkout code
@@ -28,16 +25,14 @@ jobs:
       - name: Build with openwrt/gh-action-sdk
         uses: openwrt/gh-action-sdk@v2
         env:
-          ARCH: ${{ matrix.target }}
+          ARCH: ${{ matrix.arch }}
           PACKAGE: luci-app-usbmodem
           FEEDS: luci https://github.com/openwrt/luci.git^openwrt-24.10
-          # 如果你需要额外 feeds，可以继续添加，例如：
-          # FEEDS_PACKAGES: packages https://github.com/openwrt/packages.git^openwrt-24.10
 
       - name: Upload artifact (ipk)
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.target }}-ipk
+          name: ${{ matrix.name }}-ipk
           path: bin/packages/**/*.ipk
 
       - name: Prepare release archive
@@ -45,14 +40,14 @@ jobs:
           mkdir -p artifacts
           cp bin/packages/**/*.ipk artifacts/ 2>/dev/null || true
           cd artifacts
-          tar -czvf ../${{ matrix.target }}.tar.gz .
+          tar -czvf ../${{ matrix.name }}.tar.gz .
           cd ..
 
       - name: Upload release artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.target }}-release
-          path: ${{ matrix.target }}.tar.gz
+          name: ${{ matrix.name }}-release
+          path: ${{ matrix.name }}.tar.gz
 
   release:
     name: Create Release
@@ -66,7 +61,7 @@ jobs:
           pattern: '*-release'
           path: release-pkgs
 
-      - name: List all downloaded artifacts
+      - name: List downloaded artifacts
         run: |
           ls -la release-pkgs/
           find release-pkgs -name "*.tar.gz" -exec ls -lh {} \;
