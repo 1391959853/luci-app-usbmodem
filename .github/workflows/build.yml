@@ -1,0 +1,123 @@
+name: Build and Release luci-app-usbmodem
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'luci-app-usbmodem/**'
+  workflow_dispatch:
+
+jobs:
+  # 1. 读取版本号并判断是否需要发布
+  check-version:
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.get_version.outputs.version }}
+      should_release: ${{ steps.check_release.outputs.should_release }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract version from Makefile
+        id: get_version
+        run: |
+          VERSION=$(grep -E '^PKG_VERSION:=' luci-app-usbmodem/Makefile | cut -d'=' -f2 | tr -d ' ')
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "Extracted version: ${VERSION}"
+
+      - name: Check if release already exists
+        id: check_release
+        run: |
+          VERSION="${{ steps.get_version.outputs.version }}"
+          TAG="v${VERSION}"
+          # 使用 GitHub API 检查 tag 是否存在
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/git/ref/tags/${TAG}")
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "should_release=false" >> $GITHUB_OUTPUT
+            echo "Release with tag ${TAG} already exists, will not create new release."
+          else
+            echo "should_release=true" >> $GITHUB_OUTPUT
+            echo "New version ${VERSION}, will create release."
+          fi
+
+  # 2. 编译多个架构（依赖版本检查完成）
+  build:
+    needs: check-version
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - { arch: "ramips_mt7621", sdk_slug: "ramips_mt7621_gcc-8.4.0_musl", name: "mt7621" }
+          - { arch: "x86_64", sdk_slug: "x86_64_gcc-8.4.0_musl", name: "x86_64" }
+          - { arch: "aarch64_generic", sdk_slug: "aarch64_generic_gcc-8.4.0_musl", name: "aarch64" }
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          path: package/luci-app-usbmodem
+
+      - name: Download OpenWrt SDK for ${{ matrix.target.arch }}
+        run: |
+          SDK_URL="https://downloads.openwrt.org/releases/23.05.3/targets/${{ matrix.target.arch }}/openwrt-sdk-23.05.3-${{ matrix.target.sdk_slug }}-linux.tar.xz"
+          wget -q -O sdk.tar.xz "$SDK_URL"
+          tar -xf sdk.tar.xz
+          mv openwrt-sdk-* openwrt-sdk
+
+      - name: Prepare SDK
+        run: |
+          cd openwrt-sdk
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          cp -r ../package/luci-app-usbmodem ./package/
+          echo "CONFIG_PACKAGE_luci-app-usbmodem=y" >> .config
+          make defconfig
+
+      - name: Build IPK
+        run: |
+          cd openwrt-sdk
+          make package/luci-app-usbmodem/compile V=s
+
+      - name: Upload artifact (ipk)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipk-${{ matrix.target.name }}
+          path: openwrt-sdk/bin/packages/*/*/*.ipk
+          retention-days: 7
+
+  # 3. 如果版本变化，创建 Release 并上传所有 ipk
+  release:
+    needs: [check-version, build]
+    runs-on: ubuntu-22.04
+    if: needs.check-version.outputs.should_release == 'true'
+    steps:
+      - name: Download all ipk artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect ipk files
+        run: |
+          mkdir release_pkgs
+          find artifacts -name "*.ipk" -exec cp {} release_pkgs/ \;
+          ls -la release_pkgs/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: "v${{ needs.check-version.outputs.version }}"
+          name: "v${{ needs.check-version.outputs.version }}"
+          body: |
+            Auto-built luci-app-usbmodem v${{ needs.check-version.outputs.version }}
+            - MT7621 (ramips_mt7621)
+            - x86_64
+            - aarch64_generic
+          draft: false
+          prerelease: false
+          files: release_pkgs/*.ipk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
